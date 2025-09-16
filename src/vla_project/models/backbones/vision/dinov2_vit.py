@@ -1,8 +1,11 @@
-from .vision_base import TimmViTBackbone
-
 # Registry =>> Supported DINOv2 Vision Backbones (from TIMM) =>> Note:: Using DINOv2 w/ Registers!
 #   => Reference: https://arxiv.org/abs/2309.16588
-DINOv2_VISION_BACKBONES = {"dinov2-vit-l": "vit_large_patch14_reg4_dinov2.lvd142m"}
+from vla_project.models.backbones.vision.vision_base import TimmViTBackbone
+
+DINOv2_VISION_BACKBONES = {
+    "dinov2-vit-l": "vit_large_patch14_reg4_dinov2.lvd142m",
+    "dinov2-vit-s": "vit_small_patch14_reg4_dinov2.lvd142m",
+}
 
 
 class DinoV2ViTBackbone(TimmViTBackbone):
@@ -23,3 +26,7 @@ class DinoV2ViTBackbone(TimmViTBackbone):
         )
 
 
+if __name__ == "__main__":
+    vision_backbone = DinoV2ViTBackbone("dinov2-vit-s", "resize-naive")
+    print(vision_backbone)
+    print(vision_backbone.image_transform)
