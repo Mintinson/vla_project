@@ -515,7 +515,7 @@ if __name__ == "__main__":
     import PIL
     from torchvision import transforms
 
-    img = PIL.Image.open(
+    img = PIL.Image.open(  # type: ignore
         "/home/mintinson/casualCode/pythonProject/uv_projects/vla_project/tests/resources/images/test_img_1.png"
     ).convert("RGB")
     print(img.size)

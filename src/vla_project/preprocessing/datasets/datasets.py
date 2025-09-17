@@ -6,6 +6,7 @@ including alignment and fine-tuning of vision-language models.
 
 import copy
 import json
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import cast
 
@@ -21,8 +22,16 @@ from vla_project.models.backbones.vision.vision_base import ImageTransform
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
 
+class VisionLanguageDataset[T](Dataset[T], ABC):
+    """Base class for vision-language datasets."""
 
-class AlignDataset(Dataset[dict[str, torch.Tensor | dict[str, torch.Tensor]]]):
+    def __len__(self) -> int: ...
+
+    @abstractmethod
+    def get_modality_lengths(self) -> list[tuple[bool, int]]: ...
+
+
+class AlignDataset(VisionLanguageDataset[dict[str, torch.Tensor | dict[str, torch.Tensor]]]):
     """Dataset for vision-language model alignment training.
 
     This dataset is designed for the alignment phase of vision-language model training,
@@ -180,7 +189,7 @@ class AlignDataset(Dataset[dict[str, torch.Tensor | dict[str, torch.Tensor]]]):
         return {"pixel_values": pixel_values, "input_ids": input_ids, "labels": labels}
 
 
-class FinetuneDataset(Dataset[dict[str, torch.Tensor | dict[str, torch.Tensor]]]):
+class FinetuneDataset(VisionLanguageDataset[dict[str, torch.Tensor | dict[str, torch.Tensor]]]):
     """Dataset for vision-language model fine-tuning with multi-turn conversations.
 
     This dataset handles the fine-tuning phase of vision-language model training,
