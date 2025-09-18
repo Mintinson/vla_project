@@ -24,6 +24,7 @@ Example:
         default_image_resolution=(3, 224, 224)
     )
     ```
+
 """
 
 from typing import cast
@@ -48,7 +49,7 @@ This mapping defines which dataset class should be used for each training stage:
 
 Keys:
     Training stage identifier string.
-    
+
 Values:
     Dataset class constructor for the corresponding stage.
 """
@@ -117,6 +118,7 @@ def get_dataset_and_collator(
         - The "finetune" and "full-finetune" stages both use FinetuneDataset but may
           have different configurations in practice
         - The collator is configured with the tokenizer's properties and image resolution
+
     """
     dataset_cls = DATASET_INITIALIZER[stage]
     dataset_root_dir = dataset_cfg.dataset_root_dir
@@ -131,11 +133,14 @@ def get_dataset_and_collator(
     if stage == "align":
         annotation_json, image_dir = dataset_cfg.align_stage_components
         dataset = dataset_cls(
-            dataset_root_dir / annotation_json, dataset_root_dir / image_dir, image_transform, tokenizer
+            dataset_root_dir / annotation_json,
+            dataset_root_dir / image_dir,
+            image_transform,
+            tokenizer,
         )
         return dataset, collator
 
-    elif stage == "finetune":
+    if stage == "finetune":
         annotation_json, image_dir = dataset_cfg.finetune_stage_components
         dataset = dataset_cls(
             dataset_root_dir / annotation_json,
@@ -146,7 +151,7 @@ def get_dataset_and_collator(
         )
         return dataset, collator
 
-    elif stage == "full-finetune":
+    if stage == "full-finetune":
         annotation_json, image_dir = dataset_cfg.finetune_stage_components
         dataset = dataset_cls(
             dataset_root_dir / annotation_json,
@@ -157,5 +162,5 @@ def get_dataset_and_collator(
         )
         return dataset, collator
 
-    else:
-        raise ValueError(f"Stage `{stage}` is not supported!")
+    msg = f"Stage `{stage}` is not supported!"
+    raise ValueError(msg)

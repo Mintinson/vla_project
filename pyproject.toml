@@ -39,13 +39,16 @@ lint = [
 [tool.ruff]
 line-length = 120
 target-version = "py313"
-
+select = [
+  "ALL",
+]
 
 [tool.ruff.lint]
-# extend-select = ["UP"]
+extend-select = ["UP"]
 ignore = [
     "F722",
     "D100",
-    "PLR0913"
+    "PLR0913",
+    "ERA001"
 ]
 

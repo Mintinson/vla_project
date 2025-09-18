@@ -1,25 +1,56 @@
-"""base_strategy.py
+"""Abstract base class for distributed training strategies in VLA project.
 
-Abstract class definition of a (distributed) training strategy, with full annotations of class methods, utility
-functions, and initialization logic.
+This module defines the abstract base class for training strategies used in vision-language
+and vision-language-action models. It provides a common interface and shared functionality
+for different distributed training approaches (DDP, FSDP-Grad, FSDP-Full).
 
-Training Strategies (DDP, FSDP-Grad, FSDP-Full) tend to have a lot of repeated components; this class does a lot of
-heavy lifting.
+The base strategy handles:
+    - Common training loop logic for both VLM and VLA training
+    - Optimizer and learning rate scheduler initialization
+    - Gradient clipping and accumulation
+    - Mixed precision training support
+    - Checkpoint saving and loading
+    - Metrics tracking and logging
+    - Distributed training coordination
+
+Training strategies tend to have many repeated components, and this class performs
+significant heavy lifting to reduce code duplication across concrete implementations.
+
+Example:
+    Implementing a custom training strategy:
+
+    ```python
+    class CustomStrategy(TrainingStrategy):
+        def run_setup(self, run_dir: Path, n_train_examples: int) -> None:
+            # Initialize optimizer, scheduler, and strategy-specific setup
+            pass
+
+        def clip_grad_norm(self) -> None:
+            # Implement gradient clipping for this strategy
+            pass
+
+        def save_checkpoint(self, run_dir: Path, global_step: int, epoch: int,
+                          train_loss: float | None = None, *, only_trainable: bool = True) -> None:
+            # Implement checkpoint saving for this strategy
+            pass
+    ```
+
 """
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset
+from torch.utils.data import DataLoader, DistributedSampler, IterableDataset
 from tqdm import tqdm
 
 from vla_project.models.vla.action_tokenizer import ActionTokenizer
 from vla_project.models.vlms.prismatic import PrismaticVLM
 from vla_project.overwatch.overwatch import initialize_overwatch
+from vla_project.preprocessing.datasets.datasets import VisionLanguageDataset
 from vla_project.training.metrics import Metrics, VLAMetrics
 from vla_project.utils.batching_utils import SplitModalitySampler
 from vla_project.utils.data_utils import PaddedCollatorForActionPrediction, PaddedCollatorForLanguageModeling
@@ -34,6 +65,50 @@ overwatch = initialize_overwatch(__name__)
 
 # === Abstract Base Class for an arbitrary Training Strategy ===
 class TrainingStrategy(ABC):
+    """Abstract base class for distributed training strategies.
+
+    This class provides a common interface and shared functionality for different distributed
+    training approaches including DDP (Distributed Data Parallel), FSDP-Grad, and FSDP-Full.
+    It handles the common training loop logic for both VLM (Vision-Language Model) and VLA
+    (Vision-Language-Action) training scenarios.
+
+    The class manages:
+        - Optimizer and learning rate scheduler initialization
+        - Gradient clipping and accumulation strategies
+        - Mixed precision training with automatic casting
+        - Checkpoint saving and loading mechanisms
+        - Metrics tracking and logging
+        - Distributed training coordination
+        - Multi-stage training (alignment and fine-tuning)
+
+    Attributes:
+        vlm: The vision-language model being trained.
+        device_id: GPU device ID for training.
+        stage: Training stage identifier ("align", "finetune", "full-finetune").
+        epochs: Number of training epochs.
+        max_steps: Maximum number of training steps (overrides epochs if set).
+        global_batch_size: Total batch size across all devices.
+        per_device_batch_size: Batch size per device.
+        learning_rate: Learning rate for optimization.
+        weight_decay: Weight decay for regularization.
+        max_grad_norm: Maximum gradient norm for clipping.
+        lr_scheduler_type: Type of learning rate scheduler.
+        warmup_ratio: Ratio of total steps for learning rate warmup.
+        enable_gradient_checkpointing: Whether to use gradient checkpointing.
+        enable_mixed_precision_training: Whether to use mixed precision.
+        reduce_in_full_precision: Whether to reduce gradients in full precision.
+        mixed_precision_dtype: Data type for mixed precision (typically torch.bfloat16).
+        worker_init_fn: Function to initialize DataLoader workers.
+        optimizer: The optimizer instance (initialized in run_setup).
+        lr_scheduler: The learning rate scheduler (initialized in run_setup).
+        grad_accumulation_steps: Number of gradient accumulation steps.
+
+    Note:
+        Concrete implementations must override the abstract methods:
+        save_checkpoint, run_setup, and clip_grad_norm.
+
+    """
+
     def __init__(
         self,
         vlm: PrismaticVLM,
@@ -56,7 +131,46 @@ class TrainingStrategy(ABC):
         worker_init_fn: Callable[[int], None] | None = None,
         **_: str,
     ) -> None:
-        self.vlm, self.device_id, self.stage = vlm, device_id, stage
+        """Initialize the training strategy with model and training configuration.
+
+        Args:
+            vlm: The vision-language model to be trained.
+            device_id: GPU device ID for training.
+            stage: Training stage identifier ("align", "finetune", "full-finetune").
+            epochs: Number of training epochs to run.
+            max_steps: Maximum number of training steps. If set, overrides epochs.
+            global_batch_size: Total batch size across all devices.
+            per_device_batch_size: Batch size per individual device.
+            learning_rate: Learning rate for the optimizer.
+            weight_decay: Weight decay coefficient for regularization.
+            max_grad_norm: Maximum gradient norm for clipping.
+            lr_scheduler_type: Type of learning rate scheduler to use.
+            warmup_ratio: Ratio of total steps to use for learning rate warmup.
+            enable_gradient_checkpointing: Whether to enable gradient checkpointing
+                to save memory. Defaults to True.
+            enable_mixed_precision_training: Whether to use mixed precision training.
+                Defaults to True.
+            reduce_in_full_precision: Whether to perform gradient reduction in full
+                precision. Defaults to False.
+            mixed_precision_dtype: Data type for mixed precision training.
+                Defaults to torch.bfloat16.
+            worker_init_fn: Optional function to initialize DataLoader workers.
+                Defaults to None.
+            **_: Additional keyword arguments (ignored).
+
+        Raises:
+            ValueError: If global_batch_size is not divisible by per_device_batch_size.
+            NotImplementedError: If mixed_precision_dtype is not torch.bfloat16.
+            OSError: If BFloat16 is not supported on the current hardware.
+
+        Note:
+            The optimizer and lr_scheduler attributes are initialized to None and
+            must be set up by calling run_setup() before training.
+
+        """
+        self.vlm = vlm
+        self.device_id = device_id
+        self.stage = stage
 
         # Get relevant VLM instance parameters before they get (potentially) wrapped
         self.all_module_keys, self.trainable_module_keys = self.vlm.all_module_keys, self.vlm.trainable_module_keys
@@ -104,31 +218,108 @@ class TrainingStrategy(ABC):
         train_loss: float | None = None,
         *,
         only_trainable: bool = True,
-    ) -> None: ...
+    ) -> None:
+        """Save model checkpoint to disk.
+
+        This method must be implemented by concrete training strategies to handle
+        checkpoint saving according to their specific distributed training setup.
+
+        Args:
+            run_dir: Directory where the checkpoint should be saved.
+            global_step: Current global training step number.
+            epoch: Current training epoch number.
+            train_loss: Current training loss value. Defaults to None.
+            only_trainable: Whether to save only trainable parameters.
+                Defaults to True.
+
+        Note:
+            The implementation should handle the specific requirements of the
+            distributed training strategy (e.g., DDP vs FSDP state collection).
+
+        """
+        ...
 
     @abstractmethod
-    def run_setup(self, run_dir: Path, n_train_examples: int) -> None: ...
+    def run_setup(self, run_dir: Path, n_train_examples: int) -> None:
+        """Set up the training strategy including optimizer and scheduler initialization.
+
+        This method must be implemented by concrete training strategies to handle
+        strategy-specific setup including optimizer creation, learning rate scheduler
+        initialization, and any distributed training setup.
+
+        Args:
+            run_dir: Directory for the training run.
+            n_train_examples: Total number of training examples.
+
+        Note:
+            This method should initialize the optimizer and lr_scheduler attributes
+            before training begins.
+
+        """
+        ...
 
     @abstractmethod
-    def clip_grad_norm(self) -> None: ...
+    def clip_grad_norm(self) -> None:
+        """Clip gradients according to the training strategy.
+
+        This method must be implemented by concrete training strategies to handle
+        gradient clipping according to their specific distributed setup. Different
+        strategies may require different approaches due to locality assumptions
+        (e.g., DDP vs FSDP).
+
+        Note:
+            The implementation should respect the max_grad_norm attribute and
+            handle gradient clipping appropriately for the distributed strategy.
+
+        """
+        ...
 
     def run_training(
         self,
-        dataset: Dataset,
+        dataset: VisionLanguageDataset,
         collator: PaddedCollatorForLanguageModeling,
         metrics: Metrics,
         stage: str = "finetune",
         batch_construction_strategy: str = "split-modality",
         seed: int = 7,
     ) -> None:
-        """Run the training loop for the given `dataset` and `collator`; log losses, results to `metrics`"""
+        """Run the training loop for vision-language model training.
+
+        This method orchestrates the complete training process including data loading,
+        forward/backward passes, gradient clipping, optimizer steps, and checkpoint saving.
+        It supports different batch construction strategies and handles both epoch-based
+        and step-based training termination.
+
+        Args:
+            dataset: The training dataset to use.
+            collator: Data collator for batch processing.
+            metrics: Metrics object for tracking and logging training progress.
+            stage: Training stage identifier. Defaults to "finetune".
+            batch_construction_strategy: Strategy for batch construction.
+                Currently supports "split-modality". Defaults to "split-modality".
+            seed: Random seed for data sampling. Defaults to 7.
+
+        Raises:
+            RuntimeError: If optimizer or lr_scheduler are not initialized.
+                Call run_setup() before training.
+
+        Note:
+            - Uses gradient accumulation when global_batch_size > per_device_batch_size
+            - Supports mixed precision training when enabled
+            - Automatically handles distributed training coordination
+            - Saves checkpoints based on max_steps or epoch completion
+
+        """
+        if self.optimizer is None or self.lr_scheduler is None:
+            msg = "Optimizer and/or LR Scheduler not initialized; run `run_setup` first!"
+            raise RuntimeError(msg)
         if "finetune" in stage and batch_construction_strategy == "split-modality":
             # Instantiate the split-modality sampler; if you want to extend with other batch construction schemes,
             #   (e.g., grouping by length) =>> can easily add them here!
             modality_lengths = dataset.get_modality_lengths()
             sampler = SplitModalitySampler(
-                dataset,
-                modality_lengths,
+                dataset=dataset,
+                modality_lengths=modality_lengths,
                 global_batch_size=self.global_batch_size,
                 num_replicas=overwatch.world_size(),
                 rank=overwatch.rank(),
@@ -138,7 +329,7 @@ class TrainingStrategy(ABC):
 
         else:
             sampler = DistributedSampler(
-                dataset,
+                dataset=dataset,
                 num_replicas=overwatch.world_size(),
                 rank=overwatch.rank(),
                 shuffle=True,
@@ -148,7 +339,7 @@ class TrainingStrategy(ABC):
 
         # Create a DataLoader with the initialized sampler, per-device-bsz, and collator
         dataloader = DataLoader(
-            dataset,
+            dataset=dataset,
             batch_size=self.per_device_batch_size,
             sampler=sampler,
             collate_fn=collator,
@@ -197,7 +388,7 @@ class TrainingStrategy(ABC):
                             labels=batch["labels"],
                             multimodal_indices=batch["multimodal_indices"],
                         )
-                        loss = output.loss
+                        loss = cast("torch.Tensor", output.loss)
 
                     # Commit Loss (Prior to Gradient Accumulation Normalization)
                     metrics.commit(loss=loss)
@@ -258,15 +449,51 @@ class TrainingStrategy(ABC):
         action_tokenizer: ActionTokenizer,
         metrics: VLAMetrics,
         save_interval: int = 2500,
+        *,
         save_full_model: bool = True,
     ) -> None:
-        """Run the VLA training loop for the given `dataset` and `collator`; log losses, action metrics to `metrics`."""
-        assert isinstance(vla_dataset, IterableDataset), "VLA training expects an IterableDataset!"
-        assert self.grad_accumulation_steps == 1, "VLA training does not support gradient accumulation!"
+        """Run the VLA training loop for vision-language-action model training.
 
+        This method orchestrates the complete VLA training process including data loading,
+        forward/backward passes, action token accuracy computation, gradient clipping,
+        optimizer steps, and checkpoint saving. It specifically handles action prediction
+        tasks and computes action-specific metrics.
+
+        Args:
+            vla_dataset: The VLA training dataset (must be IterableDataset).
+            collator: Data collator for action prediction batch processing.
+            action_tokenizer: Tokenizer for encoding/decoding action tokens.
+            metrics: VLA-specific metrics object for tracking training progress.
+            save_interval: Interval (in steps) for saving checkpoints. Defaults to 2500.
+            save_full_model: Whether to save the full model or only trainable parameters.
+                Defaults to True.
+
+        Raises:
+            TypeError: If vla_dataset is not an IterableDataset.
+            NotImplementedError: If gradient accumulation is enabled (not supported for VLA).
+            RuntimeError: If optimizer or lr_scheduler are not initialized.
+            ValueError: If forward pass doesn't return a loss.
+
+        Note:
+            - VLA training does not support gradient accumulation
+            - Computes action token accuracy and L1 loss on continuous actions
+            - Handles per-dataset metrics when multiple datasets are present
+            - Uses RLDS loader with implicit repeat for infinite iteration
+            - Saves checkpoints at specified intervals or upon completion
+
+        """
+        if not isinstance(vla_dataset, IterableDataset):
+            msg = "VLA training expects an IterableDataset!"
+            raise TypeError(msg)
+        if self.grad_accumulation_steps != 1:
+            msg = "VLA training does not support gradient accumulation!"
+            raise NotImplementedError(msg)
+        if self.optimizer is None or self.lr_scheduler is None:
+            msg = "Optimizer and/or LR Scheduler not initialized; run `run_setup` first!"
+            raise RuntimeError(msg)
         # Create a DataLoader =>> Set `num_workers` to 0; RLDS loader handles parallelism!
         dataloader = DataLoader(
-            vla_dataset,
+            dataset=vla_dataset,
             batch_size=self.per_device_batch_size,
             sampler=None,
             collate_fn=collator,
@@ -306,6 +533,9 @@ class TrainingStrategy(ABC):
                         labels=batch["labels"],
                     )
                     loss = output.loss
+                    if loss is None:
+                        msg = "VLA training expects a loss to be returned from `forward()`!"
+                        raise ValueError(msg)
 
                 # Commit Loss =>> Backward!
                 metrics.commit(loss=loss)
@@ -322,6 +552,7 @@ class TrainingStrategy(ABC):
                 #   2) Compute boolean "mask" where "labels > 2" (where 2 is ID for `EOS_TOKEN`)
                 #           => If masking out EOS, then it's just "labels != -100 (IGNORE_INDEX)
                 #   3) Compute masked accuracy as `(preds == logits) & mask` --> sum/divide by # unmasked!
+                assert output.logits is not None, "Logits not returned from forward()!"
                 action_preds = output.logits[:, self.vlm.vision_backbone.num_patches : -1].argmax(dim=2)
                 action_gt = batch["labels"][:, 1:].to(action_preds.device)
                 mask = action_gt > action_tokenizer.action_token_begin_idx
