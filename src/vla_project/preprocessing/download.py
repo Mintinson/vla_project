@@ -20,8 +20,9 @@ Example:
 
 """
 
+import shutil
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, Required, TypedDict
 from zipfile import ZipFile
 
 import requests
@@ -34,7 +35,7 @@ from vla_project.overwatch import initialize_overwatch
 overwatch = initialize_overwatch(__name__)
 
 
-class DatasetComponent(TypedDict, total=False):
+class DatasetComponent(TypedDict):
     """Type definition for dataset component configuration.
 
     Attributes:
@@ -46,11 +47,11 @@ class DatasetComponent(TypedDict, total=False):
 
     """
 
-    name: str
-    extract: bool
-    extract_type: str
-    url: str
-    do_rename: bool
+    name: Required[str]
+    extract: Required[bool]
+    extract_type: NotRequired[str]
+    url: Required[str]
+    do_rename: Required[bool]
 
 
 DATASET_COMPONENTS: dict[str, list[DatasetComponent]] = {
@@ -311,3 +312,49 @@ def extract_with_progress(archive_path: Path, download_dir: Path, extract_type: 
         archive_path.unlink()
 
     return extract_path
+
+
+def download_extract(dataset_id: str, root_dir: Path) -> None:
+    """Download and extract all necessary files for a given dataset ID.
+
+    This function manages the process of fetching dataset components from their respective URLs.
+    It creates a specific directory structure under `<root_dir>/download/<dataset_id>` to
+    store the downloaded files.
+
+    The function iterates through a predefined list of components for the given `dataset_id`
+    (defined in `DATASET_COMPONENTS`). It skips any component that already exists locally.
+    For each component, it performs the following steps:
+    1. Downloads the file from its URL, showing a progress bar.
+    2. If the component is marked for extraction (e.g., a .zip or .tar.gz file), it is
+        extracted into the download directory, also with a progress bar.
+    3. If the component is marked for renaming, the downloaded file or extracted directory
+        is renamed to a specified target name.
+
+    Args:
+         dataset_id (str): The unique identifier for the dataset to be downloaded. This ID
+              is used to look up the dataset's components in the `DATASET_COMPONENTS` registry.
+         root_dir (Path): The root directory where the "download" subdirectory will be
+              created and the dataset files will be stored.
+
+    Raises:
+         RuntimeError: If a dataset component is marked for extraction (`extract: True`) but
+              does not specify the `extract_type` (e.g., "zip", "tar").
+
+    """
+    (download_dir := root_dir / "download" / dataset_id).mkdir(parents=True, exist_ok=True)
+    # Download Files => Single-Threaded, with Progress Bar
+    dl_tasks = [d for d in DATASET_COMPONENTS[dataset_id] if not (download_dir / d["name"]).exists()]
+    for dl_task in dl_tasks:
+        dl_path = download_with_progress(dl_task["url"], download_dir)
+
+        # Extract Files (if specified) --> Note (assumes ".zip" ONLY!)
+        if dl_task["extract"]:
+            if "extract_type" not in dl_task:
+                msg = f"Dataset component {dl_task['name']} requires `extract_type` if `extract` is True!"
+                raise RuntimeError(msg)
+            dl_path = extract_with_progress(dl_path, download_dir, dl_task["extract_type"])
+            dl_path = dl_path.parent if dl_path.is_file() else dl_path
+
+        # Rename Path --> dl_task["name"]
+        if dl_task["do_rename"]:
+            shutil.move(dl_path, download_dir / dl_task["name"])
