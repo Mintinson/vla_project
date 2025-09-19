@@ -5,6 +5,8 @@ ADM:   https://github.com/openai/guided-diffusion/blob/main/guided_diffusion
 IDDPM: https://github.com/openai/improved-diffusion/blob/main/improved_diffusion/gaussian_diffusion.py
 """
 
+from __future__ import annotations
+
 import enum
 from collections.abc import Callable, Generator, Sequence
 from typing import Any, Literal, TypedDict, cast
@@ -540,7 +542,7 @@ class GaussianDiffusion:
 
     def condition_mean(
         self,
-        cond_fn: Callable[[torch.Tensor, torch.Tensor, dict[str, Any]], torch.Tensor] | "nn.Module",
+        cond_fn: Callable[[torch.Tensor, torch.Tensor, dict[str, Any]], torch.Tensor] | nn.Module,
         p_mean_var: ModelOutput,
         x: torch.Tensor,
         t: torch.Tensor,
@@ -572,7 +574,7 @@ class GaussianDiffusion:
 
     def condition_score(
         self,
-        cond_fn: "Callable[[torch.Tensor, torch.Tensor, dict[str, Any]], torch.Tensor] | nn.Module",
+        cond_fn: Callable[[torch.Tensor, torch.Tensor, dict[str, Any]], torch.Tensor] | nn.Module,
         p_mean_var: ModelOutput,
         x: torch.Tensor,
         t: torch.Tensor,

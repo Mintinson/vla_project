@@ -134,3 +134,7 @@ class PhiLLMBackbone(HFCausalLLMBackbone):
 
         """
         return [self.llm.lm_head, self.llm.model.final_layernorm]
+
+if __name__ == "__main__":
+    phi = PhiLLMBackbone("phi-2-3b")
+    # phi.freeze_backbones("vision")

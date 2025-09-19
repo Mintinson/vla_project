@@ -555,10 +555,3 @@ class DiT(nn.Module):
         # return torch.cat([eps, rest], dim=1)
         return torch.cat([eps, rest], dim=2)  # (N, T, C)
 
-
-if __name__ == "__main__":
-    # Test the DiT model with dummy inputs
-    embedder = TimestepEmbedder(hidden_size=512)
-    t = torch.randint(0, 1000, (4,))
-    t_emb = embedder(t)
-    print(f"Timestep embeddings shape: {t_emb.shape}")

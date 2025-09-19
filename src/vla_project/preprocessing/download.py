@@ -17,6 +17,7 @@ Example:
     # Extract an archive
     extract_path = extract_with_progress(file_path, Path("./data"), "directory")
     ```
+
 """
 
 from pathlib import Path
@@ -42,6 +43,7 @@ class DatasetComponent(TypedDict, total=False):
         extract_type: Type of extraction ("file" or "directory").
         url: The URL to download the component from.
         do_rename: Whether to rename the downloaded/extracted content.
+
     """
 
     name: str
@@ -53,18 +55,18 @@ class DatasetComponent(TypedDict, total=False):
 
 DATASET_COMPONENTS: dict[str, list[DatasetComponent]] = {
     """Dictionary containing dataset component configurations for different datasets.
-    
+
     This dictionary defines the components (files and directories) that need to be downloaded
     for various vision-language datasets. Each dataset has a list of components with their
     download URLs, extraction requirements, and storage configurations.
-    
+
     Supported datasets:
         - llava-laion-cc-sbu-558k: LLaVA pretraining dataset with chat traces and images
         - llava-v1.5-instruct: LLaVA v1.5 instruction following dataset with multiple image sources
-    
+
     Keys:
         Dataset identifier string
-    
+
     Values:
         List of DatasetComponent configurations for each component
     """
@@ -159,6 +161,7 @@ def convert_to_jpg(image_dir: Path) -> None:
         - Skips files that are already in JPG/JPEG format
         - Skips files where a JPG version already exists
         - For GIF files, only the first frame is converted
+
     """
     overwatch.info(f"Converting all images in {image_dir} to JPG format...")
     for image_fn in tqdm(list(image_dir.iterdir())):
@@ -171,7 +174,8 @@ def convert_to_jpg(image_dir: Path) -> None:
         elif image_fn.suffix in {".png", ".PNG"}:
             Image.open(image_fn).convert("RGB").save(jpg_fn)
         else:
-            raise ValueError(f"Unsupported image format: {image_fn.suffix}")
+            msg = f"Unsupported image format: {image_fn.suffix}"
+            raise ValueError(msg)
 
 
 def download_with_progress(url: str, download_dir: Path, chunk_size_bytes: int = 1024) -> Path:
@@ -201,13 +205,14 @@ def download_with_progress(url: str, download_dir: Path, chunk_size_bytes: int =
         ...     download_dir
         ... )
         >>> print(f"Downloaded to: {file_path}")
+
     """
     overwatch.info(f"Downloading {(dest_path := download_dir / Path(url).name)} from `{url}`", ctx_level=1)
     if dest_path.exists():
         return dest_path
 
     # Otherwise --> fire an HTTP Request, with `stream = True` (to avoid loading all in memory)
-    response = requests.get(url, stream=True)
+    response = requests.get(url, stream=True)  # noqa: S113
 
     # Download w/ Transfer-Aware Progress
     #   => Reference: https://github.com/Textualize/rich/blob/master/examples/downloader.py
@@ -223,9 +228,11 @@ def download_with_progress(url: str, download_dir: Path, chunk_size_bytes: int =
     ) as dl_progress:
         # add a new task to the progress bar
         dl_tid = dl_progress.add_task(
-            "Downloading", fname=dest_path.name, total=int(response.headers.get("content-length", "None"))
+            "Downloading",
+            fname=dest_path.name,
+            total=int(response.headers.get("content-length", "None")),
         )
-        with open(dest_path, "wb") as f:
+        with Path(dest_path).open("wb") as f:
             for data in response.iter_content(chunk_size=chunk_size_bytes):
                 # update task (step by size of data read)
                 dl_progress.advance(dl_tid, f.write(data))
@@ -233,7 +240,7 @@ def download_with_progress(url: str, download_dir: Path, chunk_size_bytes: int =
     return dest_path
 
 
-def extract_with_progress(archive_path: Path, download_dir: Path, extract_type: str, cleanup: bool = False) -> Path:
+def extract_with_progress(archive_path: Path, download_dir: Path, extract_type: str, *, cleanup: bool = False) -> Path:
     """Extract compressed archives with a Rich-based progress bar.
 
     Extracts ZIP archives to the specified directory, displaying a progress bar
@@ -249,7 +256,7 @@ def extract_with_progress(archive_path: Path, download_dir: Path, extract_type: 
         Path to the extracted content (first extracted file/directory).
 
     Raises:
-        AssertionError: If the archive is not a ZIP file or if extract_type is "file" but
+        ValueError: If the archive is not a ZIP file or if extract_type is "file" but
                        archive contains multiple files.
         ValueError: If extract_type is not "file" or "directory".
         zipfile.BadZipFile: If the archive is corrupted or invalid.
@@ -265,30 +272,39 @@ def extract_with_progress(archive_path: Path, download_dir: Path, extract_type: 
         ...     cleanup=True
         ... )
         >>> print(f"Extracted to: {extracted_path}")
+
     """
-    assert archive_path.suffix == ".zip", "Only `.zip` compressed archives are supported for now!"
+    if archive_path.suffix != ".zip":
+        msg = "Only `.zip` compressed archives are supported for now!"
+        raise ValueError(msg)
+
     overwatch.info(f"Extracting {archive_path.name} to `{download_dir}`", ctx_level=1)
 
     # Extract w/ Progress
-    with Progress(
-        TextColumn("[bold]{task.description} - {task.fields[aname]}"),
-        BarColumn(bar_width=None),
-        "[progress.percentage]{task.percentage:>3.1f}%",
-        "•",
-        MofNCompleteColumn(),
-        transient=True,
-    ) as ext_progress:
-        with ZipFile(archive_path) as zf:
-            ext_tid = ext_progress.add_task("Extracting", aname=archive_path.name, total=len(members := zf.infolist()))
-            extract_path = Path(zf.extract(members[0], download_dir))
-            if extract_type == "file":
-                assert len(members) == 1, f"Archive `{archive_path}` with extract type `{extract_type} has > 1 member!"
-            elif extract_type == "directory":
-                for member in members[1:]:
-                    zf.extract(member, download_dir)
-                    ext_progress.advance(ext_tid)
-            else:
-                raise ValueError(f"Extract type `{extract_type}` for archive `{archive_path}` is not defined!")
+    with (
+        Progress(
+            TextColumn("[bold]{task.description} - {task.fields[aname]}"),
+            BarColumn(bar_width=None),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            "•",
+            MofNCompleteColumn(),
+            transient=True,
+        ) as ext_progress,
+        ZipFile(archive_path) as zf,
+    ):
+        ext_tid = ext_progress.add_task("Extracting", aname=archive_path.name, total=len(members := zf.infolist()))
+        extract_path = Path(zf.extract(members[0], download_dir))
+        if extract_type == "file":
+            if len(members) != 1:
+                msg = f"Archive `{archive_path}` with extract type `{extract_type}` has > 1 member!"
+                raise RuntimeError(msg)
+        elif extract_type == "directory":
+            for member in members[1:]:
+                zf.extract(member, download_dir)
+                ext_progress.advance(ext_tid)
+        else:
+            msg = f"Extract type `{extract_type}` for archive `{archive_path}` is not defined!"
+            raise ValueError(msg)
 
     # Cleanup (if specified)
     if cleanup:

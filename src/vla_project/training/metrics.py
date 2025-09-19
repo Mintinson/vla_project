@@ -333,7 +333,7 @@ class Metrics:
         global_step: int | None = None,
         lr: float | None = None,
         update_step_time: bool = False,
-        **kwargs,
+        **kwargs,  # noqa: ANN003
     ) -> None:
         """Update metric buffers with new values.
 
