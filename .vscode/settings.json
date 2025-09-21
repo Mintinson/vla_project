@@ -1,5 +1,13 @@
 {
     "python.analysis.typeCheckingMode": "standard",
+    "python.analysis.extraPaths": [
+        "./third_party/dlimp"
+    ],
+    "python.analysis.autoSearchPaths": true,
+    "python.analysis.include": [
+        "./src/**",
+        "./third_party/**"
+    ],
     "cSpell.words": [
         "Overwatch",
         "timestep"

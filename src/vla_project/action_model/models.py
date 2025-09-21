@@ -110,8 +110,7 @@ class TimestepEmbedder(nn.Module):
 
         """
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size).to(next(self.mlp.parameters()).dtype)
-        t_emb = self.mlp(t_freq)
-        return t_emb
+        return self.mlp(t_freq)
 
 
 class LabelEmbedder(nn.Module):
@@ -170,14 +169,13 @@ class LabelEmbedder(nn.Module):
             drop_ids = torch.rand(conditions.shape[0], device=conditions.device) < self.dropout_prob
         else:
             drop_ids = force_drop_ids == 1
-        conditions = torch.where(
+        return torch.where(
             drop_ids.unsqueeze(1).unsqueeze(1).expand(conditions.shape[0], *self.uncondition.shape),
             self.uncondition,
             conditions,
         )
-        return conditions
 
-    def forward(self, conditions: Tensor, train: bool, force_drop_ids: Tensor | None = None) -> Tensor:
+    def forward(self, conditions: Tensor, *, train: bool, force_drop_ids: Tensor | None = None) -> Tensor:
         """Forward pass through the label embedder.
 
         Args:
@@ -193,8 +191,7 @@ class LabelEmbedder(nn.Module):
         use_dropout = self.dropout_prob > 0
         if (train and use_dropout) or (force_drop_ids is not None):
             conditions = self.token_drop(conditions, force_drop_ids)
-        embeddings = self.linear(conditions)
-        return embeddings
+        return self.linear(conditions)
 
 
 #################################################################################
@@ -268,8 +265,7 @@ class HistoryEmbedder(nn.Module):
             Tensor: Action history embeddings.
 
         """
-        x = self.linear(x)
-        return x
+        return self.linear(x)
 
 
 #################################################################################
@@ -291,7 +287,7 @@ class DiTBlock(nn.Module):
 
     """
 
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0, **block_kwargs) -> None:
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0, **block_kwargs) -> None:  # noqa: ANN003
         """Initialize the DiT block.
 
         Args:
@@ -321,8 +317,7 @@ class DiTBlock(nn.Module):
 
         """
         x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
+        return x + self.mlp(self.norm2(x))
 
 
 class FinalLayer(nn.Module):
@@ -360,8 +355,7 @@ class FinalLayer(nn.Module):
 
         """
         x = self.norm_final(x)
-        x = self.linear(x)
-        return x
+        return self.linear(x)
 
 
 class DiT(nn.Module):
@@ -465,7 +459,7 @@ class DiT(nn.Module):
         """
 
         # Initialize transformer layers:
-        def _basic_init(module):
+        def _basic_init(module: nn.Module) -> None:
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
@@ -523,7 +517,11 @@ class DiT(nn.Module):
         return x[:, 1:, :]  # (N, T, C)
 
     def forward_with_cfg(
-        self, x: Float[Tensor, "n t d"], t: Tensor, z: Float[Tensor, "n 1 d"], cfg_scale: float,
+        self,
+        x: Float[Tensor, "n t d"],
+        t: Tensor,
+        z: Float[Tensor, "n 1 d"],
+        cfg_scale: float,
     ) -> Float[Tensor, "n t c"]:
         """Forward pass with classifier-free guidance.
 
@@ -554,4 +552,3 @@ class DiT(nn.Module):
         eps = torch.cat([half_eps, half_eps], dim=0)  # (N, T, in_channels)
         # return torch.cat([eps, rest], dim=1)
         return torch.cat([eps, rest], dim=2)  # (N, T, C)
-

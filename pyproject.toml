@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.11.7",
     "rich>=14.1.0",
     "tensorflow>=2.20.0",
+    "tensorflow-datasets>=4.9.9",
     "timm>=1.0.19",
     "torch>=2.8.0",
     "torchvision>=0.23.0",
@@ -35,6 +36,9 @@ dev = [
 ]
 lint = [
     "ruff>=0.12.12",
+]
+local = [
+    "dlimp @ file:///d:/learningSomething/casualCode/casualPython/uv_projects/vla_project/third_party/dlimp",
 ]
 
 [tool.ruff]

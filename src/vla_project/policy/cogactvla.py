@@ -209,7 +209,7 @@ class CogACT(nn.Module):
         """
         return self.vlm.vision_backbone
 
-    def freeze_backbones(self, stage: str):
+    def freeze_backbones(self, stage: str) -> None:
         """Freeze model backbones based on training stage.
 
         Args:
@@ -571,7 +571,7 @@ class CogACT(nn.Module):
                 **kwargs,
             )
 
-        cognition_features = output.hidden_states[0][-1][:, -1, :]
+        cognition_features = output.hidden_states[0][-1][:, -1, :]  # pyright: ignore[reportOptionalSubscript, reportAttributeAccessIssue]
         if cognition_features.shape[:2] != (1, 4096):
             msg = "Batch size must be 1 for action prediction"
             raise ValueError(msg)

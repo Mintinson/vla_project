@@ -68,6 +68,9 @@ class ModelConfig(ChoiceRegistry):
     enable_mixed_precision_training: bool = True            # Whether to enable mixed precision training
     reduce_in_full_precision: bool = False                  # Whether to run gradient reduction in FP32
 
+    # Need Action Tokenizer
+    need_action_tokenization: bool = True
+
     # fmt: on
 
 

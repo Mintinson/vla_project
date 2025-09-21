@@ -1,0 +1,13 @@
+{
+    "include": [
+        "src",
+        "third_party"
+    ],
+    "extraPaths": [
+        "./third_party/dlimp"
+    ],
+    "pythonVersion": "3.13",
+    "typeCheckingMode": "standard",
+    "useLibraryCodeForTypes": true,
+    "autoSearchPaths": true
+}
