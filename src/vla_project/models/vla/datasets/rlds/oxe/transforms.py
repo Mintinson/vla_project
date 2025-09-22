@@ -16,18 +16,18 @@ Transforms adopt the following structure:
 
 from typing import Any
 
-# import tensorflow as tf
+import tensorflow as tf
 import torch
-from prismatic.vla.datasets.rlds.utils.data_utils import (
-    binarize_gripper_actions,
-    invert_gripper_actions,
-    rel2abs_gripper_actions,
-    relabel_bridge_actions,
-)
 
 from vla_project.models.vla.datasets.rlds.oxe.utils.droid_utils import (
     droid_baseact_transform,
     droid_finetuning_transform,
+)
+from vla_project.models.vla.datasets.rlds.utils.data_utils import (
+    binarize_gripper_actions,
+    invert_gripper_actions,
+    rel2abs_gripper_actions,
+    relabel_bridge_actions,
 )
 
 

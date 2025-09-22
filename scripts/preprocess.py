@@ -1,4 +1,4 @@
-"""preprocess.py
+"""Core script for automatically downloading raw VLM pretraining datasets.
 
 Core script for automatically downloading raw VLM pretraining datasets. Supports downloading the following datasets:
     - LLaVA v1.5 Datasets (for both training stages) [`llava-laion-cc-sbu-558k`, `llava-v1.5-instruct`]
@@ -24,6 +24,17 @@ overwatch = initialize_overwatch(__name__)
 
 @dataclass
 class PreprocessConfig:
+    """Configuration for preprocessing VLM pretraining datasets.
+
+    Attributes
+    ----------
+    dataset_id : str
+        Unique identifier for dataset to process (see above).
+    root_dir : Path
+        Path to root directory for storing datasets.
+
+    """
+
     # fmt: off
     dataset_id: str = "llava-v1.5-instruct"                     # Unique identifier for dataset to process (see above)
     root_dir: Path = Path("data")                               # Path to root directory for storing datasets
@@ -33,6 +44,18 @@ class PreprocessConfig:
 
 @draccus.wrap()
 def preprocess(cfg: PreprocessConfig) -> None:
+    """Download, extract, and preprocess the specified VLM pretraining dataset.
+
+    Parameters
+    ----------
+    cfg : PreprocessConfig
+        Configuration object containing dataset_id and root_dir.
+
+    Returns
+    -------
+    None
+
+    """
     overwatch.info(f"Downloading & Extracting `{cfg.dataset_id}` to `{cfg.root_dir / 'download'}")
     download_extract(cfg.dataset_id, root_dir=cfg.root_dir)
 

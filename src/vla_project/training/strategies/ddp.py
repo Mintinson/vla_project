@@ -256,3 +256,71 @@ class DDPStrategy(TrainingStrategy):
 
         """
         torch.nn.utils.clip_grad_norm_(self.vlm.parameters(), max_norm=self.max_grad_norm)
+
+    def load_optimizer_and_scheduler(self, checkpoint_path: str | Path) -> None:
+        """Load optimizer and scheduler state from checkpoint for DDP training.
+
+        This method loads the optimizer and learning rate scheduler state from a previously
+        saved checkpoint. Unlike FSDP, DDP doesn't require special state dictionary handling
+        since the optimizer state is saved in standard PyTorch format.
+
+        Args:
+            checkpoint_path: Path to the main checkpoint file. The optimizer state is
+                expected to be in a corresponding file with .optimizer extension.
+
+        Raises:
+            TypeError: If the VLM is not wrapped in DDP.
+
+        Note:
+            - Loads optimizer state directly without FSDP-specific transformations
+            - Uses CPU mapping to avoid device conflicts during loading
+            - Warns if optimizer checkpoint is missing but continues execution
+            - LR scheduler state is loaded along with optimizer state
+
+        """
+        if not isinstance(self.vlm, DDP):
+            msg = "DDPStrategy.load_optimizer_and_scheduler assumes VLM is already wrapped in DDP!"
+            raise TypeError(msg)
+
+        checkpoint_path = Path(checkpoint_path)
+
+        # Check for traditional checkpoint format first (with optimizer in main checkpoint)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        if "optimizer" in checkpoint:
+            # Traditional format: optimizer state is in the main checkpoint file
+            overwatch.info(f"Loading optimizer state from main checkpoint: {checkpoint_path}")
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+
+            # Load scheduler state if available
+            if "scheduler" in checkpoint:
+                self.lr_scheduler.load_state_dict(checkpoint["scheduler"])
+                overwatch.info("Loaded learning rate scheduler state")
+
+        else:
+            # FSDP-style format: look for separate optimizer file
+            optimizer_path = self._get_optimizer_path(checkpoint_path)
+            if not optimizer_path.exists():
+                overwatch.warning(f"Optimizer checkpoint not found at {optimizer_path}!")
+                return
+
+            overwatch.info(f"Loading optimizer state from separate file: {optimizer_path}")
+            optim_checkpoint = torch.load(optimizer_path, map_location="cpu")
+
+            # Extract optimizer state from the checkpoint structure
+            if "optimizer" in optim_checkpoint:
+                self.optimizer.load_state_dict(optim_checkpoint["optimizer"])
+            else:
+                # Direct optimizer state dict
+                self.optimizer.load_state_dict(optim_checkpoint)
+
+            # Load scheduler state if available
+            if "scheduler" in optim_checkpoint:
+                self.lr_scheduler.load_state_dict(optim_checkpoint["scheduler"])
+                overwatch.info("Loaded learning rate scheduler state")
+
+        overwatch.info("Successfully loaded optimizer state for DDP training")
+
+    def _get_optimizer_path(self, checkpoint_path: Path) -> Path:
+        """Get the path to the optimizer checkpoint file."""
+        return checkpoint_path.with_suffix(".optimizer")

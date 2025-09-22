@@ -59,6 +59,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.distributed.fsdp import (
+    FullOptimStateDictConfig,
     FullStateDictConfig,
     MixedPrecision,
     ShardingStrategy,
@@ -450,3 +451,29 @@ class FSDPStrategy(TrainingStrategy):
             f"         |-> Dataset Size = {n_train_examples} Examples\n"
             f"         |-> Max Steps = {num_training_steps}\n",
         )
+
+    def load_optimizer_and_scheduler(self, checkpoint_path: str | Path) -> None:
+        """Load a checkpoint from the specified `checkpoint_path`."""
+        if not isinstance(self.vlm, FSDP):
+            msg = "FSDPStrategy.load_optimizer_and_scheduler assumes VLM is already wrapped in FSDP!"
+            raise TypeError(msg)
+        checkpoint_path = Path(checkpoint_path)
+        optimizer_path = self._get_optimizer_path(checkpoint_path)
+        if not optimizer_path.exists():
+            overwatch.warning(f"Optimizer checkpoint not found at {optimizer_path}!")
+            return
+        # Load Checkpoint =>> Note that FSDP will automatically handle device placement!
+        optim_state_dict = torch.load(optimizer_path, map_location="cpu")
+        with FSDP.state_dict_type(
+            self.vlm,
+            self.fsdp_state_dict_type,
+            FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+            FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=False),
+        ):
+            optim_state_dict = FSDP.optim_state_dict_to_load(self.vlm, self.optimizer, optim_state_dict["optimizer"])
+            self.optimizer.load_state_dict(optim_state_dict)
+        overwatch.info(f"Loaded optimizer state dict from {optimizer_path}")
+
+    def _get_optimizer_path(self, checkpoint_path: Path) -> Path:
+        """Get the path to the optimizer checkpoint file."""
+        return checkpoint_path.with_suffix(".optimizer")

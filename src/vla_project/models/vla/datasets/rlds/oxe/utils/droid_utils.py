@@ -1,6 +1,7 @@
 """Episode transforms for DROID dataset."""
 
 # import tensorflow_graphics.geometry.transformation as tfg
+import tensorflow as tf
 import torch
 from jaxtyping import Float
 
@@ -87,7 +88,8 @@ def _axis_angle_rotation(axis: str, angle: torch.Tensor) -> torch.Tensor:
 
 
 def matrix_to_euler_angles(
-    matrix: Float[torch.Tensor, ..., 3, 3], convention: str = "XYZ",
+    matrix: Float[torch.Tensor, ..., 3, 3],
+    convention: str = "XYZ",
 ) -> Float[torch.Tensor, ..., 3]:
     """Convert rotations given as rotation matrices to Euler angles in radians.
 
@@ -226,16 +228,16 @@ def velocity_act_to_wrist_frame(velocity: torch.Tensor, wrist_in_robot_frame: to
         to the wrist frame, which is useful for end-effector control.
 
     """
-    R_frame = euler_angles_to_matrix(wrist_in_robot_frame[:, 3:6]) # (bs, 3, 3)
+    R_frame = euler_angles_to_matrix(wrist_in_robot_frame[:, 3:6])  # (bs, 3, 3)
     R_frame_inv = inverse_rotation_matrix(R_frame)  # (bs, 3, 3)
 
     # world to wrist: dT_pi = R^-1 dT_rbt
-    vel_t = (R_frame_inv @ velocity[:, :3][..., None])[..., 0] # (bs, 3)
+    vel_t = (R_frame_inv @ velocity[:, :3][..., None])[..., 0]  # (bs, 3)
 
     # world to wrist: dR_pi = R^-1 dR_rbt R
     dR = euler_angles_to_matrix(velocity[:, 3:6])
     dR = R_frame_inv @ (dR @ R_frame)
-    dR_r6 = rotmat_to_rot6d(dR) # (bs, 6)
+    dR_r6 = rotmat_to_rot6d(dR)  # (bs, 6)
     return torch.concat([vel_t, dR_r6], dim=-1)
 
 
@@ -439,3 +441,47 @@ def zero_action_filter(traj: dict) -> bool:
     DROID_NORM_0_ACT = 2 * (torch.zeros_like(traj["action"][:, :6]) - DROID_Q01) / (DROID_Q99 - DROID_Q01 + 1e-8) - 1
 
     return bool(torch.any(torch.abs(traj["action"][:, :6] - DROID_NORM_0_ACT) > 1e-5).item())
+
+
+def torch_tensor_tf_tensor(tensor: torch.Tensor) -> tf.Tensor:
+    """Convert a PyTorch tensor to a TensorFlow tensor.
+
+    Args:
+        tensor: Input PyTorch tensor.
+
+    Returns:
+        Converted TensorFlow tensor.
+
+    Note:
+        This function handles conversion of data types and ensures the
+        resulting TensorFlow tensor has the same shape and values as the
+        input PyTorch tensor.
+
+    """
+    if not isinstance(tensor, torch.Tensor):
+        msg = f"Input must be a torch.Tensor, got {type(tensor)}"
+        raise TypeError(msg)
+    np_array = tensor.cpu().numpy()
+    return tf.convert_to_tensor(np_array)
+
+
+def tf_tensor_torch_tensor(tensor: tf.Tensor) -> torch.Tensor:
+    """Convert a TensorFlow tensor to a PyTorch tensor.
+
+    Args:
+        tensor: Input TensorFlow tensor.
+
+    Returns:
+        Converted PyTorch tensor.
+
+    Note:
+        This function handles conversion of data types and ensures the
+        resulting PyTorch tensor has the same shape and values as the
+        input TensorFlow tensor.
+
+    """
+    if not isinstance(tensor, tf.Tensor):
+        msg = f"Input must be a tf.Tensor, got {type(tensor)}"
+        raise TypeError(msg)
+    np_array = tensor.numpy()  # pyright: ignore[reportOptionalCall]
+    return torch.from_numpy(np_array)

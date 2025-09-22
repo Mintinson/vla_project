@@ -376,6 +376,7 @@ class PrismaticVLM(VLM):
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         multimodal_indices: torch.LongTensor | None = None,
+        **kwargs,
     ) -> CausalLMOutputWithPast:
         """Forward pass through the Prismatic VLM.
 

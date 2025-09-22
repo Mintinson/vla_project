@@ -108,8 +108,10 @@ class SpacedDiffusion(GaussianDiffusion):
         Args:
             use_timesteps: A collection (sequence or set) of timesteps from the
                 original diffusion process to retain.
-            **kwargs: Additional keyword arguments to create the base diffusion process.
-                Must include 'betas' parameter.
+            betas (np.ndarray): Array of beta values for the diffusion process.
+            model_mean_type (ModelMeanType): Type of mean prediction for the model.
+            model_var_type (ModelVarType): Type of variance prediction for the model.
+            loss_type (LossType): Type of loss function to use.
 
         """
         self.use_timesteps = set(use_timesteps)

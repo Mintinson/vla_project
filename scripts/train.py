@@ -1,18 +1,54 @@
-"""
-train.py
+r"""Training script for Vision-Language-Action (VLA) policies.
 
-Training script for Vision-Language-Action (VLA) Policies, built on top of pretrained VLMs, trained using mixtures of
-the Open-X Embodiment dataset. Performs training in native PyTorch, using Fully-Sharded Data Parallel (FSDP) to run
-distributed across GPUs (and nodes). By default, assumes that CUDA toolkit is >= 11.0 (to support BF16 mixed precision).
+This script implements the complete training pipeline for CogACT Vision-Language-Action
+policies built on top of pretrained Vision-Language Models (VLMs). It supports distributed
+training across multiple GPUs using PyTorch's Fully-Sharded Data Parallel (FSDP) and
+trains on mixtures of the Open-X Embodiment dataset.
 
-Notes & Prerequisites:
-    - If you want to set a custom location for all HF / TIMM artifacts --> `export HF_HOME="<PATH>"` *before* running!
-        => For example (add to end of .bashrc): `export HF_HOME="/mnt/fsx/skaramcheti/cache"`
-    - If you want to suppress random Tensorflow logs --> `export TF_CPP_MIN_LOG_LEVEL=3`
+Key Features:
+    - Multi-stage training: alignment, fine-tuning, and full fine-tuning
+    - Support for action diffusion models with different architectures (DiT-S/B/L)
+    - Action chunking for predicting future action sequences
+    - Exponential Moving Average (EMA) support for action models
+    - Comprehensive experiment tracking with Weights & Biases
+    - Flexible backbone freezing configurations
+    - Advanced routing mechanisms for improved performance
 
-Run with:
-    - [Single Node One-GPU (Debug)] : torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/train.py
-    - [Single Node Multi-GPU (= $K)]: torchrun --standalone --nnodes 1 --nproc-per-node $K vla-scripts/train.py
+Architecture Support:
+    - Vision backbones: DINOv2, SigLIP, and other TIMM models
+    - Language backbones: LLaMA, Phi, and other HuggingFace models
+    - Action models: Diffusion Transformer (DiT) variants
+    - Training strategies: FSDP with mixed precision support
+
+Environment Variables:
+    TRAIN_ROUTE: Enable/disable routing mechanisms ("TRUE"/"FALSE")
+    ADD_LSTM: Enable/disable LSTM components ("TRUE"/"FALSE")
+    RANDOM_SEED: Random seed for reproducibility
+    HF_HOME: Custom HuggingFace cache directory
+    TF_CPP_MIN_LOG_LEVEL: Suppress TensorFlow logging (set to "3")
+
+Usage Examples:
+    Single GPU debugging:
+        torchrun --standalone --nnodes 1 --nproc-per-node 1 scripts/train.py
+
+    Multi-GPU training:
+        torchrun --standalone --nnodes 1 --nproc-per-node 4 scripts/train.py \\
+            --vla.vla_id "cogact-oxe-magic-soup" \\
+            --seed 42 \\
+            --image_aug
+
+    Resume training from checkpoint:
+        torchrun --standalone --nnodes 1 --nproc-per-node 4 scripts/train.py \\
+            --pretrained_checkpoint "/path/to/checkpoint.pt" \\
+            --is_resume \\
+            --resume_step 10000 \\
+            --resume_epoch 5
+
+Prerequisites:
+    - CUDA toolkit >= 11.0 for BF16 mixed precision support
+    - Open-X Embodiment dataset properly formatted
+    - Sufficient GPU memory for chosen batch size and model configuration
+
 """
 
 import json
@@ -20,12 +56,10 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple, Union
 
 import draccus
 import torch
 import torch.distributed as dist
-import wandb
 import yaml
 
 from vla_project.config import VLAConfig, VLARegistry
@@ -51,53 +85,115 @@ overwatch = initialize_overwatch(__name__)
 
 @dataclass
 class TrainConfig:
+    """Configuration dataclass for VLA training parameters.
+
+    This configuration class manages all hyperparameters, paths, and settings for
+    training Vision-Language-Action policies. It includes VLA-specific parameters,
+    dataset configurations, training options, and experiment tracking settings.
+
+    Attributes:
+        vla: VLA model configuration specifying architecture and training parameters.
+        data_root_dir: Root directory containing the Open-X Embodiment dataset.
+        run_root_dir: Directory for storing training logs and checkpoints.
+        pretrained_checkpoint: Path to checkpoint for resuming training.
+        is_resume: Whether to resume from a previous training run.
+        resume_step: Global step number to resume from (must match checkpoint).
+        resume_epoch: Epoch number to resume from (must match checkpoint).
+        run_id: Unique identifier for this training run.
+        run_id_note: Additional note to append to run ID.
+        save_interval: Number of steps between checkpoint saves.
+        image_aug: Whether to enable image data augmentation.
+        seed: Random seed for reproducibility.
+        hf_token: HuggingFace authentication token for gated models.
+        trackers: Tuple of tracking systems to use (e.g., "jsonl", "wandb").
+        wandb_project: Weights & Biases project name.
+        wandb_entity: Weights & Biases entity/organization name.
+        repeated_diffusion_steps: Number of repeated steps for action diffusion training.
+        load_all_data_for_training: Whether to load the complete training dataset.
+        future_action_window_size: Number of future actions to predict (action chunking).
+        past_action_window_size: Number of past actions to consider (currently unused).
+        action_model_type: Diffusion Transformer variant ('DiT-S', 'DiT-B', 'DiT-L').
+        use_ema: Whether to use Exponential Moving Average for action model.
+        action_dim: Dimensionality of the action space.
+        load_dit: Whether to load DiT components.
+
+    Example:
+        >>> cfg = TrainConfig(
+        ...     run_id="my_vla_experiment",
+        ...     image_aug=True,
+        ...     future_action_window_size=10,
+        ...     action_model_type="DiT-B"
+        ... )
+        >>> # Configuration will inherit optimization parameters from vla config
+
+    """
+
     # fmt: off
 
     # VLAConfig (`conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
     vla: VLAConfig = field(
-        default_factory=VLAConfig.get_choice_class(VLARegistry.EXP_COGACT_OXE_MAGIC_SOUP_PLUS_MINUS.vla_id)
+        default_factory=VLAConfig.get_choice_class(VLARegistry.EXP_COGACT_OXE_MAGIC_SOUP_PLUS_MINUS.vla_id),
     )
 
     # Directory Paths
     data_root_dir: Path = Path(                                     # Path to Open-X dataset directory
-        "datasets/open-x-embodiment"
+        "datasets/open-x-embodiment",
     )
     run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
 
     # Resume Run Parameters
-    pretrained_checkpoint: Optional[Union[str, Path]] = None                  # Absolute Path to Checkpoint
+    pretrained_checkpoint: str | Path | None = None                  # Absolute Path to Checkpoint
     is_resume: bool = True                                          # Whether we are continuing a prior training run
                                                                     # (only applicable given pretrained checkpoint)
-    resume_step: Optional[int] = None                               # Global Step to Resume (should match checkpoint)
-    resume_epoch: Optional[int] = None                              # Epoch to Resume (should match checkpoint)
+    resume_step: int | None = None                               # Global Step to Resume (should match checkpoint)
+    resume_epoch: int | None = None                              # Epoch to Resume (should match checkpoint)
 
     # Run Arguments
-    run_id: Optional[str] = None                                    # Run ID for logging, Weights & Biases
-    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
+    run_id: str | None = None                                    # Run ID for logging, Weights & Biases
+    run_id_note: str | None = None                               # Extra note for logging, Weights & Biases
     save_interval: int = 2500                                       # Interval for saving checkpoints (in steps)
     image_aug: bool = False                                         # Whether to enable image augmentations
     # seed: int = 42                                                  # Random seed (for reproducibility)
     seed: int = random_seed                                                 # Random seed (for reproducibility)
 
     # HF Hub Credentials (for any gated models)
-    hf_token: Union[str, Path] = Path(".hf_token")                  # Environment variable or Path to HF Token
+    hf_token: str | Path = Path(".hf_token")                  # Environment variable or Path to HF Token
 
     # Tracking Parameters
     # trackers: Tuple[str, ...] = ("wandb")                  # Trackers to initialize (if W&B, add config!)
-    trackers: Tuple[str, ...] = ("jsonl")                         # Trackers to initialize (if W&B, add config!)
+    trackers: tuple[str, ...] = ("jsonl")                         # Trackers to initialize (if W&B, add config!)
     wandb_project: str = ""                                         # Name of W&B project to log to (use default!)
     wandb_entity: str = ""                                          # Name of entity to log under
     repeated_diffusion_steps: int = 8                               # Repeated steps for training action model (a diffusion model)
-    load_all_data_for_training: bool = True                         # Load all training data 
+    load_all_data_for_training: bool = True                         # Load all training data
     future_action_window_size: int = 15                             # Action chunking, predicting future actions + current action
-    past_action_window_size: int = 0                                # Action history window size, not used now, set to be 0 
-    action_model_type: str = 'DiT-B'                                # Action model type, chose from ['DiT-S', 'DiT-B', 'DiT-L']
+    past_action_window_size: int = 0                                # Action history window size, not used now, set to be 0
+    action_model_type: str = "DiT-B"                                # Action model type, chose from ['DiT-S', 'DiT-B', 'DiT-L']
     use_ema: bool = False                                           # EMA version of action model
     action_dim: int = 7                                             # Dimension of action space
-    load_dit: bool = True  
+    load_dit: bool = True
 
     def __post_init__(self) -> None:
-        """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
+        """Initialize optimization parameters from VLA config and validate world size.
+
+        Extracts and sets training hyperparameters from the VLA configuration for
+        convenient access during training. Also validates that the expected world
+        size matches the actual number of available GPUs.
+
+        Sets the following parameters from vla config:
+            - Training schedule: epochs, max_steps
+            - Batch sizes: global_batch_size, per_device_batch_size  
+            - Optimization: learning_rate, weight_decay, max_grad_norm
+            - Learning rate schedule: lr_scheduler_type, warmup_ratio
+            - Training strategy: distributed training configuration
+
+        Raises:
+            AssertionError: If expected_world_size doesn't match actual GPU count.
+
+        Note:
+            This method is called automatically after dataclass initialization.
+
+        """
         self.epochs = self.vla.epochs
         self.max_steps = self.vla.max_steps
         self.global_batch_size = self.vla.global_batch_size
@@ -121,6 +217,59 @@ class TrainConfig:
 
 @draccus.wrap()
 def train(cfg: TrainConfig) -> None:
+    r"""Execute the complete VLA training pipeline.
+
+    This function orchestrates the entire training process for CogACT Vision-Language-Action
+    policies, including model initialization, dataset preparation, distributed training setup,
+    and experiment tracking. It supports various training stages and architectural configurations.
+
+    The training pipeline includes:
+        1. Distributed training setup with FSDP
+        2. VLA model loading/creation with optional checkpoint resumption
+        3. Backbone freezing configuration based on training stage
+        4. Open-X dataset preparation with action chunking
+        5. Training strategy initialization with optimizer setup
+        6. Metrics tracking and checkpoint management
+        7. Main VLA training loop execution
+
+    Training Stages:
+        - "align": Fine-tune projector only (frozen backbones)
+        - "finetune": Fine-tune projector + LLM (frozen vision)
+        - "full-finetune": Fine-tune all components
+        - "vla-sandwich-train": Vision + projector + last LLM layer
+        - "vla-last-layer-train": Last LLM layer only
+
+    Args:
+        cfg: Configuration object containing all training parameters, model settings,
+            dataset configuration, and experiment tracking options.
+
+    Raises:
+        RuntimeError: If distributed training setup fails.
+        ValueError: If backbone freezing configuration is not supported.
+        FileNotFoundError: If checkpoint files or dataset paths are missing.
+        AssertionError: If checkpoint validation fails during resume.
+
+    Environment Dependencies:
+        TRAIN_ROUTE: Controls routing mechanism activation
+        ADD_LSTM: Controls LSTM component usage
+        RANDOM_SEED: Sets reproducibility seed
+
+    Note:
+        This function is designed to run under `torchrun` for distributed training.
+        It automatically handles GPU device assignment, process group management,
+        and resource cleanup.
+
+    Example:
+        Run with torchrun for multi-GPU training:
+        ```bash
+        TRAIN_ROUTE=TRUE ADD_LSTM=FALSE RANDOM_SEED=42 \\
+        torchrun --standalone --nnodes 1 --nproc-per-node 4 scripts/train.py \\
+            --vla.vla_id "cogact-oxe-magic-soup" \\
+            --image_aug \\
+            --future_action_window_size 15
+        ```
+
+    """
     overwatch.info("CogACT-VLA Training :: Warming Up")
 
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
@@ -149,7 +298,7 @@ def train(cfg: TrainConfig) -> None:
     # Save Configuration =>> additionally save a JSON version for later HF Integration
     if overwatch.is_rank_zero():
         draccus.dump(cfg, open(run_dir / "config.yaml", "w"))
-        with open(run_dir / "config.yaml", "r") as f_yaml, open(run_dir / "config.json", "w") as f_json:
+        with open(run_dir / "config.yaml") as f_yaml, open(run_dir / "config.json", "w") as f_json:
             yaml_cfg = yaml.safe_load(f_yaml)
             json.dump(yaml_cfg, f_json, indent=2)
 
@@ -217,11 +366,14 @@ def train(cfg: TrainConfig) -> None:
     elif cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone and cfg.vla.unfreeze_last_llm_layer:
         stage = "vla-last-layer-train"  # Fine-tuning LLM last layer only
     else:
-        raise ValueError(
+        msg = (
             "Weight freezing configuration not supported. VLA config has the following parameters: "
             f"freeze_vision_backbone: {cfg.vla.freeze_vision_backbone}"
             f"freeze_llm_backbone: {cfg.vla.freeze_llm_backbone}"
             f"unfreeze_last_llm_layer: {cfg.vla.unfreeze_last_llm_layer}"
+        )
+        raise ValueError(
+            msg,
         )
 
     # [Explicit] Call to `freeze_backbones` here for clarity =>> will log exactly what is/is not frozen
@@ -240,25 +392,25 @@ def train(cfg: TrainConfig) -> None:
         vla.llm_backbone.llm.model.route1.requires_grad_(True)
         vla.llm_backbone.llm.model.route2.requires_grad_(True)
         # vla.llm_backbone.llm.model.route.requires_grad_(True)
-        overwatch.info(f"`vla.llm_backbone.llm.model.route1 and route2` has been unfreezed.")
+        overwatch.info("`vla.llm_backbone.llm.model.route1 and route2` has been unfreezed.")
     else:
         # vla.llm_backbone.llm.model.route1.requires_grad_(True)
         # vla.llm_backbone.llm.model.route2.requires_grad_(True)
         # vla.llm_backbone.llm.model.lstm.requires_grad_(True)
-        overwatch.info(f"`our train model is baseline")
-        overwatch.info(f"`route1, route2 and lstm have been unfreezed.")
+        overwatch.info("`our train model is baseline")
+        overwatch.info("`route1, route2 and lstm have been unfreezed.")
     if add_lstm == "TRUE" and train_route == "TRUE":
         # vla.lstm.vlm.requires_grad_(True)
         vla.llm_backbone.llm.model.lstm.requires_grad_(True)
-        overwatch.info(f"`vla.llm_backbone.llm.model.lstm` has been unfreezed.")
+        overwatch.info("`vla.llm_backbone.llm.model.lstm` has been unfreezed.")
     else:
-        overwatch.info(f"This model not have lstm architecture.")
+        overwatch.info("This model not have lstm architecture.")
 
     # Print number of total/trainable model parameters
     num_params = sum(p.numel() for p in vla.parameters())
     num_trainable_params = sum(p.numel() for p in vla.parameters() if p.requires_grad)
     overwatch.info(
-        f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
+        f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable",
     )
 
     overwatch.info(f"Creating VLA Open-X Dataset with Mixture `{cfg.vla.data_mix}`")
@@ -360,4 +512,4 @@ def train(cfg: TrainConfig) -> None:
 
 
 if __name__ == "__main__":
-    train()
+    train()  # pyright: ignore[reportCallIssue]

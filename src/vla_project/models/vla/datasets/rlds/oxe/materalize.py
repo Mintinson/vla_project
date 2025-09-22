@@ -1,5 +1,4 @@
-"""
-materialize.py
+"""materialize.py
 
 Factory class for initializing Open-X Embodiment dataset kwargs and other parameters; provides and exports functions for
 clear control flow.
@@ -7,12 +6,12 @@ clear control flow.
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
-from prismatic.overwatch import initialize_overwatch
-from prismatic.vla.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS, ActionEncoding
-from prismatic.vla.datasets.rlds.oxe.transforms import OXE_STANDARDIZATION_TRANSFORMS
-from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
+from vla_project.models.vla.datasets.rlds.oxe.configs import OXE_DATASET_CONFIGS, ActionEncoding
+from vla_project.models.vla.datasets.rlds.oxe.transforms import OXE_STANDARDIZATION_TRANSFORMS
+from vla_project.models.vla.datasets.rlds.utils.data_utils import NormalizationType
+from vla_project.overwatch import initialize_overwatch
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -21,12 +20,12 @@ overwatch = initialize_overwatch(__name__)
 def make_oxe_dataset_kwargs(
     dataset_name: str,
     data_root_dir: Path,
-    load_camera_views: Tuple[str] = ("primary",),
+    load_camera_views: tuple[str] = ("primary",),
     load_depth: bool = False,
     load_proprio: bool = True,
     load_language: bool = True,
     action_proprio_normalization_type: NormalizationType = NormalizationType.NORMAL,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Generates config (kwargs) for given dataset from Open-X Embodiment."""
     dataset_kwargs = deepcopy(OXE_DATASET_CONFIGS[dataset_name])
     if dataset_kwargs["action_encoding"] not in [ActionEncoding.EEF_POS, ActionEncoding.EEF_R6]:
@@ -78,15 +77,14 @@ def make_oxe_dataset_kwargs(
 
 def get_oxe_dataset_kwargs_and_weights(
     data_root_dir: Path,
-    mixture_spec: List[Tuple[str, float]],
-    load_camera_views: Tuple[str] = ("primary",),
+    mixture_spec: list[tuple[str, float]],
+    load_camera_views: tuple[str] = ("primary",),
     load_depth: bool = False,
     load_proprio: bool = True,
     load_language: bool = True,
     action_proprio_normalization_type: NormalizationType = NormalizationType.NORMAL,
-) -> Tuple[Dict[str, Any], List[float]]:
-    """
-    Generates dataset kwargs for a given dataset mix from the Open X-Embodiment dataset. The returned kwargs
+) -> tuple[dict[str, Any], list[float]]:
+    """Generates dataset kwargs for a given dataset mix from the Open X-Embodiment dataset. The returned kwargs
     (per-dataset configs) and weights can be passed directly to `make_interleaved_dataset`.
 
     :param data_root_dir: Base directory containing RLDS/TFDS-formatted datasets (from Open-X)
@@ -121,7 +119,7 @@ def get_oxe_dataset_kwargs_and_weights(
                     load_proprio,
                     load_language,
                     action_proprio_normalization_type,
-                )
+                ),
             )
             sampling_weights.append(d_weight)
 

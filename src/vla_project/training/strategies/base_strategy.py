@@ -38,12 +38,14 @@ Example:
 """
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.distributed as dist
+from torch import nn
 from torch.utils.data import DataLoader, DistributedSampler, IterableDataset
 from tqdm import tqdm
 
@@ -61,6 +63,15 @@ if TYPE_CHECKING:
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
+
+@torch.no_grad()
+def update_ema(ema_model: nn.Module, model: nn.Module, decay: float = 0.9999) -> None:
+    """Step the EMA model towards the current model."""
+    ema_params = OrderedDict(ema_model.named_parameters())
+    model_params = OrderedDict(model.named_parameters())
+    for name, param in model_params.items():
+        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
+        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
 # === Abstract Base Class for an arbitrary Training Strategy ===
@@ -129,6 +140,7 @@ class TrainingStrategy(ABC):
         reduce_in_full_precision: bool = False,
         mixed_precision_dtype: torch.dtype = torch.bfloat16,
         worker_init_fn: Callable[[int], None] | None = None,
+        repeated_diffusion_steps: int = 0,
         **_: str,
     ) -> None:
         """Initialize the training strategy with model and training configuration.
@@ -156,6 +168,8 @@ class TrainingStrategy(ABC):
                 Defaults to torch.bfloat16.
             worker_init_fn: Optional function to initialize DataLoader workers.
                 Defaults to None.
+            repeated_diffusion_steps: Number of diffusion steps to repeat. (Only used if using
+               action diffusion models). Defaults to 0.
             **_: Additional keyword arguments (ignored).
 
         Raises:
@@ -188,7 +202,7 @@ class TrainingStrategy(ABC):
         self.enable_mixed_precision_training = enable_mixed_precision_training
         self.reduce_in_full_precision = reduce_in_full_precision
         self.mixed_precision_dtype = mixed_precision_dtype
-
+        self.repeated_diffusion_steps = repeated_diffusion_steps
         # DataLoader Parameters
         self.worker_init_fn = worker_init_fn
 
@@ -387,6 +401,7 @@ class TrainingStrategy(ABC):
                             pixel_values=batch["pixel_values"],
                             labels=batch["labels"],
                             multimodal_indices=batch["multimodal_indices"],
+                            repeated_diffusion_steps=self.repeated_diffusion_steps,  # only used when used CogACT
                         )
                         loss = cast("torch.Tensor", output.loss)
 
@@ -446,11 +461,12 @@ class TrainingStrategy(ABC):
         self,
         vla_dataset: IterableDataset,
         collator: PaddedCollatorForActionPrediction,
-        action_tokenizer: ActionTokenizer,
         metrics: VLAMetrics,
         save_interval: int = 2500,
         *,
+        action_tokenizer: ActionTokenizer | None = None,
         save_full_model: bool = True,
+        action_model: bool = False,
     ) -> None:
         """Run the VLA training loop for vision-language-action model training.
 
@@ -510,14 +526,15 @@ class TrainingStrategy(ABC):
             disable=not overwatch.is_rank_zero(),
         ) as progress:
             self.vlm.train()
-
+            if hasattr(self.vlm, "use_ema") and self.vlm.use_ema == True:
+                self.vlm.ema_diffusion.eval()
             # Zero Gradients (just in case)
             self.optimizer.zero_grad()
 
             # [Contract] DataLoader wraps RLDS Loader (`.as_numpy_iterator() =>> implicit `.repeat()`)
             #   => This means looping over the DataLoader is basically "infinite" (so no outer loop over epochs).
             #      Slightly breaks default PyTorch semantics, which is why we adaptively compute `epoch` below.
-            for batch in dataloader:
+            for train_idx, batch in enumerate(dataloader):
                 # Note that we'll unpack batch (and let AMP/FSDP do its thing) in the VLM.forward() call
                 #   => Basically, if we're using mixed precision (or not), autocast()/FSDP will move to device!
                 with torch.autocast(
@@ -525,14 +542,25 @@ class TrainingStrategy(ABC):
                     dtype=self.mixed_precision_dtype,
                     enabled=self.enable_mixed_precision_training,
                 ):
-                    # [Contract] self.vlm.forward() must automatically compute `loss` and return!
-                    output: CausalLMOutputWithPast = self.vlm(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        pixel_values=batch["pixel_values"],
-                        labels=batch["labels"],
-                    )
-                    loss = output.loss
+                    if action_model:
+                        loss, output = self.vlm(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch["attention_mask"],
+                            actions=batch["actions"],
+                            pixel_values=batch["pixel_values"],
+                            action_masks=batch["action_masks"],
+                            labels=batch["labels"],
+                            output_hidden_states=True,
+                        )
+                    else:
+                        # [Contract] self.vlm.forward() must automatically compute `loss` and return!
+                        output: CausalLMOutputWithPast = self.vlm(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch["attention_mask"],
+                            pixel_values=batch["pixel_values"],
+                            labels=batch["labels"],
+                        )
+                        loss = output.loss
                     if loss is None:
                         msg = "VLA training expects a loss to be returned from `forward()`!"
                         raise ValueError(msg)
@@ -541,64 +569,65 @@ class TrainingStrategy(ABC):
                 metrics.commit(loss=loss)
                 loss.backward()
 
-                # === Compute Action Token Accuracy & L1 Loss ===
+                if action_tokenizer is not None:
+                    # === Compute Action Token Accuracy & L1 Loss ===
 
-                # To compute action token accuracy, we need to identify the locations of the action tokens
-                # in both `output.logits` and `batch["labels"]`. We know that when "right" padding, we
-                # insert `self.vlm.vision_backbone.num_patches` at index 1.
-                #
-                # Computing `action_prediction_accuracy` is then pretty straightforward:
-                #   1) Extract "aligned" predictions & labels
-                #   2) Compute boolean "mask" where "labels > 2" (where 2 is ID for `EOS_TOKEN`)
-                #           => If masking out EOS, then it's just "labels != -100 (IGNORE_INDEX)
-                #   3) Compute masked accuracy as `(preds == logits) & mask` --> sum/divide by # unmasked!
-                assert output.logits is not None, "Logits not returned from forward()!"
-                action_preds = output.logits[:, self.vlm.vision_backbone.num_patches : -1].argmax(dim=2)
-                action_gt = batch["labels"][:, 1:].to(action_preds.device)
-                mask = action_gt > action_tokenizer.action_token_begin_idx
+                    # To compute action token accuracy, we need to identify the locations of the action tokens
+                    # in both `output.logits` and `batch["labels"]`. We know that when "right" padding, we
+                    # insert `self.vlm.vision_backbone.num_patches` at index 1.
+                    #
+                    # Computing `action_prediction_accuracy` is then pretty straightforward:
+                    #   1) Extract "aligned" predictions & labels
+                    #   2) Compute boolean "mask" where "labels > 2" (where 2 is ID for `EOS_TOKEN`)
+                    #           => If masking out EOS, then it's just "labels != -100 (IGNORE_INDEX)
+                    #   3) Compute masked accuracy as `(preds == logits) & mask` --> sum/divide by # unmasked!
+                    assert output.logits is not None, "Logits not returned from forward()!"
+                    action_preds = output.logits[:, self.vlm.vision_backbone.num_patches : -1].argmax(dim=2)
+                    action_gt = batch["labels"][:, 1:].to(action_preds.device)
+                    mask = action_gt > action_tokenizer.action_token_begin_idx
 
-                # Compute Accuracy
-                correct_preds = (action_preds == action_gt) & mask
-                action_accuracy = correct_preds.sum().float() / mask.sum().float()
+                    # Compute Accuracy
+                    correct_preds = (action_preds == action_gt) & mask
+                    action_accuracy = correct_preds.sum().float() / mask.sum().float()
 
-                # Compute L1 Loss on Predicted (Continuous) Actions
-                continuous_actions_pred = torch.tensor(
-                    action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy()),
-                )
-                continuous_actions_gt = torch.tensor(
-                    action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy()),
-                )
-                action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
+                    # Compute L1 Loss on Predicted (Continuous) Actions
+                    continuous_actions_pred = torch.tensor(
+                        action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy()),
+                    )
+                    continuous_actions_gt = torch.tensor(
+                        action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy()),
+                    )
+                    action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
 
-                # Commit Metrics
-                metrics.commit(action_accuracy=action_accuracy, l1_loss=action_l1_loss, update_step_time=True)
+                    # Commit Metrics
+                    metrics.commit(action_accuracy=action_accuracy, l1_loss=action_l1_loss, update_step_time=True)
 
-                # Compute metrics per dataset --> only on rank_zero since we don't log them on other workers anyways
-                if overwatch.is_rank_zero():
-                    datasets = set(batch["dataset_names"])
-                    if len(datasets) > 1:
-                        for ds in datasets:
-                            ds_mask = torch.tensor([elem == ds for elem in batch["dataset_names"]])
-                            action_accuracy_ds = correct_preds[ds_mask].sum().float() / mask[ds_mask].sum().float()
-                            continuous_actions_pred_ds = torch.tensor(
-                                action_tokenizer.decode_token_ids_to_actions(
-                                    action_preds[ds_mask][mask[ds_mask]].cpu().numpy(),
-                                ),
-                            )
-                            continuous_actions_gt_ds = torch.tensor(
-                                action_tokenizer.decode_token_ids_to_actions(
-                                    action_gt[ds_mask][mask[ds_mask]].cpu().numpy(),
-                                ),
-                            )
-                            action_l1_loss_ds = torch.nn.functional.l1_loss(
-                                continuous_actions_pred_ds,
-                                continuous_actions_gt_ds,
-                            )
-                            metrics.commit_for_dataset(
-                                dataset_name=ds.decode(),
-                                action_accuracy=action_accuracy_ds,
-                                l1_loss=action_l1_loss_ds,
-                            )
+                    # Compute metrics per dataset --> only on rank_zero since we don't log them on other workers anyways
+                    if overwatch.is_rank_zero():
+                        datasets = set(batch["dataset_names"])
+                        if len(datasets) > 1:
+                            for ds in datasets:
+                                ds_mask = torch.tensor([elem == ds for elem in batch["dataset_names"]])
+                                action_accuracy_ds = correct_preds[ds_mask].sum().float() / mask[ds_mask].sum().float()
+                                continuous_actions_pred_ds = torch.tensor(
+                                    action_tokenizer.decode_token_ids_to_actions(
+                                        action_preds[ds_mask][mask[ds_mask]].cpu().numpy(),
+                                    ),
+                                )
+                                continuous_actions_gt_ds = torch.tensor(
+                                    action_tokenizer.decode_token_ids_to_actions(
+                                        action_gt[ds_mask][mask[ds_mask]].cpu().numpy(),
+                                    ),
+                                )
+                                action_l1_loss_ds = torch.nn.functional.l1_loss(
+                                    continuous_actions_pred_ds,
+                                    continuous_actions_gt_ds,
+                                )
+                                metrics.commit_for_dataset(
+                                    dataset_name=ds.decode(),
+                                    action_accuracy=action_accuracy_ds,
+                                    l1_loss=action_l1_loss_ds,
+                                )
 
                 # === Gradient Step ===
 
@@ -608,7 +637,10 @@ class TrainingStrategy(ABC):
                 # Optimizer & LR Scheduler Step
                 self.optimizer.step()
                 self.lr_scheduler.step()
+                if hasattr(self.vlm, "use_ema") and self.vlm.use_ema == True:
+                    update_ema(self.vlm.ema_diffusion, self.vlm.action_model)
                 self.optimizer.zero_grad()
+
 
                 # Compute epoch value using number of completed gradient steps
                 epoch = (metrics.global_step + 1) // (len(vla_dataset) // self.global_batch_size)
@@ -636,3 +668,16 @@ class TrainingStrategy(ABC):
                 # Update Progress Bar
                 progress.update()
                 progress.set_description(status)
+
+    @abstractmethod
+    def load_optimizer_and_scheduler(self, checkpoint_path: str | Path) -> None:
+        """Load the optimizer and learning rate scheduler state from a checkpoint.
+
+        Args:
+            checkpoint_path: Path to the checkpoint file from which to load the optimizer and scheduler states.
+
+        Note:
+            Concrete implementations should restore the optimizer and scheduler states as appropriate for the strategy.
+
+        """
+        ...

@@ -1,22 +1,53 @@
-"""pretrain.py
+r"""Pretraining script for Prismatic Vision-Language Models.
 
-Pretraining script for Prismatic VLM pretraining in native PyTorch, using Fully-Sharded Data Parallel (FSDP) to run
-distributed training across GPUs. By default, assumes that CUDA toolkit is >= 11.0 (to support BF16 mixed precision).
+This script implements distributed training for Prismatic VLMs using PyTorch's Fully-Sharded
+Data Parallel (FSDP) to scale across multiple GPUs. It supports both alignment and fine-tuning
+stages for vision-language model training.
 
-Notes & Prerequisites:
-    - We're loading LLaMa-2 (and possibly other) gated models from HuggingFace (HF Hub); these require an auth_token.
-      For LLaMa-2, make sure to first get Meta approval, then fill out the form at the top of the HF LLaMa-2 page:
-        => Link: https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
-        => Generate Token (from `huggingface.co`): Settings / Access Tokens / New "Read" Token
-        => Set `cfg.hf_token` to file path with token (as single line text file) or environment variable name
+The script handles the complete training pipeline including:
+    - Model instantiation (vision backbone + LLM backbone)
+    - Dataset loading and preprocessing
+    - Distributed training setup with FSDP
+    - Checkpoint management and logging
+    - Integration with Weights & Biases for experiment tracking
 
-    - If you want to set a custom location for all HF / TIMM artifacts --> `export HF_HOME="<PATH>"` *before* running!
-        => For example (add to end of .bashrc): `export HF_HOME="/mnt/fsx/skaramcheti/cache"`
+Key Features:
+    - Multi-stage training: alignment (projector-only) and fine-tuning (projector + LLM)
+    - Support for gated models from HuggingFace Hub (e.g., LLaMA-2)
+    - Mixed precision training with BF16 support
+    - Gradient checkpointing for memory efficiency
+    - Comprehensive logging and metric tracking
 
-Run with:
-    - [Single Node One-GPU (Debug)] : torchrun --standalone --nnodes 1 --nproc-per-node 1 scripts/pretrain.py
-    - [Single Node Multi-GPU (= $K)]: torchrun --standalone --nnodes 1 --nproc-per-node $K scripts/pretrain.py
-    - [Multi-Node/AWS Sagemaker] Depends on your individual setup; file an issue if you have trouble!
+Prerequisites:
+    - CUDA toolkit >= 11.0 for BF16 mixed precision support
+    - HuggingFace authentication token for gated models
+    - Proper distributed training setup for multi-GPU scenarios
+
+Usage Examples:
+    Single GPU debugging:
+        torchrun --standalone --nnodes 1 --nproc-per-node 1 scripts/pretrain.py
+
+    Multi-GPU training:
+        torchrun --standalone --nnodes 1 --nproc-per-node 4 scripts/pretrain.py
+
+    Custom configuration:
+        torchrun --standalone --nnodes 1 --nproc-per-node 4 scripts/pretrain.py \\
+            --model.model_id "prism-dinosiglip-controlled-7b" \\
+            --stage "finetune" \\
+            --seed 42
+
+Environment Variables:
+    HF_HOME: Custom location for HuggingFace/TIMM artifacts cache
+    TOKENIZERS_PARALLELISM: Set to "false" for PyTorch DataLoader compatibility
+
+Notes:
+    For LLaMA-2 and other gated models:
+    1. Get Meta approval for LLaMA-2 access
+    2. Generate HuggingFace access token with "Read" permissions
+    3. Set cfg.hf_token to token file path or environment variable
+
+    Link: https://huggingface.co/meta-llama/Llama-2-7b-chat-hf
+
 """
 
 import json
@@ -45,6 +76,36 @@ overwatch = initialize_overwatch(__name__)
 
 @dataclass
 class PretrainConfig:
+    """Configuration dataclass for Prismatic VLM pretraining.
+
+    This configuration class manages all hyperparameters and settings for training
+    Prismatic Vision-Language Models. It supports different training stages (align,
+    finetune) and automatically configures optimization parameters based on the
+    selected stage.
+
+    Attributes:
+        model: Model configuration specifying architecture, backbones, and training settings.
+        dataset: Dataset configuration for data loading and preprocessing.
+        stage: Training stage, either "align" (projector-only) or "finetune" (projector + LLM).
+        pretrained_checkpoint: Path to pretrained checkpoint for fine-tuning stage.
+        run_id: Unique identifier for this training run.
+        run_root_dir: Root directory for storing logs and checkpoints.
+        seed: Random seed for reproducibility.
+        hf_token: HuggingFace authentication token for gated models.
+        trackers: Tuple of tracking systems to use (e.g., "jsonl", "wandb").
+        wandb_project: Weights & Biases project name for experiment tracking.
+        wandb_entity: Weights & Biases entity/organization name.
+
+    Example:
+        >>> cfg = PretrainConfig(
+        ...     stage="finetune",
+        ...     run_id="my_vlm_experiment",
+        ...     seed=42
+        ... )
+        >>> # Configuration will automatically set optimization parameters for finetune stage
+
+    """
+
     # fmt: off
 
     # ModelConfig (`prismatic/conf/models.py`); override with --model.type `ModelRegistry.<MODEL>.model_id`
@@ -77,7 +138,28 @@ class PretrainConfig:
     wandb_entity: str | None = "stanford-voltron"                # Name of W&B entity (default: None)
 
     def __post_init__(self) -> None:
-        """Set optimization parameters based on `stage` in {"align", "finetune"}."""
+        """Configure optimization parameters based on the training stage.
+
+        Automatically sets learning rate, batch size, scheduler, and other optimization
+        parameters based on the specified training stage. This ensures stage-appropriate
+        hyperparameters are used without manual configuration.
+
+        The method configures the following parameters for each stage:
+            - Learning rate and weight decay
+            - Batch sizes (global and per-device)
+            - Learning rate scheduler type and warmup ratio
+            - Maximum gradient norm for clipping
+            - Training strategy (e.g., FSDP configuration)
+            - Number of epochs and maximum steps
+
+        Raises:
+            ValueError: If the specified stage is not supported.
+
+        Note:
+            This method is called automatically after dataclass initialization
+            and modifies the instance's optimization parameters in-place.
+
+        """
         if self.stage == "align":
             self.epochs = self.model.align_epochs
             self.max_steps = self.model.align_max_steps
@@ -115,10 +197,50 @@ class PretrainConfig:
 
 @draccus.wrap()
 def pretrain(cfg: PretrainConfig) -> None:
+    r"""Execute the complete Prismatic VLM training pipeline.
+
+    This function orchestrates the entire training process for Prismatic Vision-Language
+    Models, including model initialization, dataset preparation, distributed training
+    setup, and experiment tracking. It supports both alignment and fine-tuning stages
+    with automatic parameter configuration.
+
+    The training pipeline includes:
+        1. Distributed training setup with FSDP
+        2. Vision and language backbone loading
+        3. VLM model instantiation and checkpoint loading
+        4. Dataset preparation with appropriate transforms
+        5. Training strategy initialization
+        6. Metrics tracking and logging setup
+        7. Main training loop execution
+
+    Args:
+        cfg: Configuration object containing all training parameters, model settings,
+            dataset configuration, and experiment tracking options.
+
+    Raises:
+        RuntimeError: If distributed training setup fails.
+        FileNotFoundError: If required checkpoint files or tokens are missing.
+        ValueError: If configuration parameters are invalid.
+
+    Note:
+        This function is designed to run under `torchrun` for distributed training.
+        It automatically handles GPU device assignment, process group initialization,
+        and cleanup.
+
+    Example:
+        Run with torchrun for distributed training:
+        ```bash
+        torchrun --standalone --nnodes 1 --nproc-per-node 4 scripts/pretrain.py \\
+            --stage "finetune" \\
+            --model.model_id "prism-dinosiglip-controlled-7b" \\
+            --seed 42
+        ```
+
+    """
     overwatch.info("Prismatic VLM Training :: Gathering Light")
 
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
-    torch.cuda.set_device(device_id := overwatch.local_rank()) # pyright: ignore[reportAttributeAccessIssue]
+    torch.cuda.set_device(device_id := overwatch.local_rank())  # pyright: ignore[reportAttributeAccessIssue]
     torch.cuda.empty_cache()
 
     # Create Unique Run Name & Save Directory
@@ -132,12 +254,12 @@ def pretrain(cfg: PretrainConfig) -> None:
     overwatch.info('"Life is like a prism; what you see depends on how you turn the glass."', ctx_level=1)
     hf_token = cfg.hf_token.read_text().strip() if isinstance(cfg.hf_token, Path) else os.environ[cfg.hf_token]
     worker_init_fn = set_global_seed(cfg.seed, get_worker_init_fn=True)
-    Path(run_dir:= cfg.run_root_dir / cfg.run_id).mkdir(parents=True, exist_ok=True)
+    Path(run_dir := cfg.run_root_dir / cfg.run_id).mkdir(parents=True, exist_ok=True)
     Path(run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     if overwatch.is_rank_zero():
         # Additionally save a JSON version of the config
-        draccus.dump(cfg, open(run_dir / "config.yaml", "w"))
-        with open(run_dir / "config.yaml") as f_yaml, open(run_dir / "config.json", "w") as f_json:
+        draccus.dump(cfg, (run_dir / "config.yaml").open("w"))
+        with (run_dir / "config.yaml").open() as f_yaml, (run_dir / "config.json").open("w") as f_json:
             yaml_cfg = yaml.safe_load(f_yaml)
             json.dump(yaml_cfg, f_json, indent=2)
 
@@ -160,7 +282,7 @@ def pretrain(cfg: PretrainConfig) -> None:
     overwatch.info(f"Instantiating PrismaticVLM `{model_id}` for Training Stage = `{cfg.stage}`")
     vlm = get_vlm(
         model_id,
-        cfg.model.arch_specifier,
+        cfg.model.arch_specifier,  # pyright: ignore[reportArgumentType]
         vision_backbone,
         llm_backbone,
         enable_mixed_precision_training=cfg.model.enable_mixed_precision_training,
@@ -207,7 +329,7 @@ def pretrain(cfg: PretrainConfig) -> None:
         reduce_in_full_precision=cfg.model.reduce_in_full_precision,
         worker_init_fn=worker_init_fn,
     )
-    train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(train_dataset))
+    train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(train_dataset))  # pyright: ignore[reportArgumentType]
 
     # Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
     overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
@@ -224,7 +346,7 @@ def pretrain(cfg: PretrainConfig) -> None:
 
     # Run Training
     overwatch.info("Starting Training Loop")
-    train_strategy.run_training(train_dataset, collator, metrics, stage=cfg.stage, seed=cfg.seed)
+    train_strategy.run_training(train_dataset, collator, metrics, stage=cfg.stage, seed=cfg.seed)  # pyright: ignore[reportArgumentType]
 
     # Finalize
     overwatch.info("Done with Training =>> Finalizing Metrics")
