@@ -171,7 +171,7 @@ wheels = [
 [[package]]
 name = "dlimp"
 version = "0.0.1"
-source = { directory = "third_party/dlimp" }
+source = { editable = "third_party/dlimp" }
 dependencies = [
     { name = "tensorflow" },
     { name = "tensorflow-datasets" },
@@ -1934,6 +1934,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
+    { name = "dlimp" },
     { name = "draccus" },
     { name = "einops" },
     { name = "jaxtyping" },
@@ -1958,13 +1959,11 @@ dev = [
 lint = [
     { name = "ruff" },
 ]
-local = [
-    { name = "dlimp" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=1.10.1" },
+    { name = "dlimp", editable = "third_party/dlimp" },
     { name = "draccus", specifier = ">=0.11.5" },
     { name = "einops", specifier = ">=0.8.1" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
@@ -1985,7 +1984,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.4.2" }]
 lint = [{ name = "ruff", specifier = ">=0.12.12" }]
-local = [{ name = "dlimp", directory = "third_party/dlimp" }]
 
 [[package]]
 name = "wadler-lindig"
