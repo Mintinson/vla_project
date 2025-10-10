@@ -297,6 +297,7 @@ class GaussianDiffusion:
             else np.array([])
         )
 
+        # beta * sqrt((1 - alpha_cumprod_prev) / (1 - alpha_cumprod))
         self.posterior_mean_coef1 = betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         self.posterior_mean_coef2 = (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod)
 
@@ -364,7 +365,7 @@ class GaussianDiffusion:
         distribution q(x_{t-1} | x_t, x_0) in the reverse diffusion process.
 
         Args:
-            x_start (torch.Tensor): Clean data tensor x_0.
+            x_start (torch.Tensor): Clean data tensor x_0. (predicted)
             x_t (torch.Tensor): Noisy data tensor x_t.
             t (torch.Tensor): Timestep values.
 
