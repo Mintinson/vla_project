@@ -1,11 +1,10 @@
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, cast, override
+from typing import TYPE_CHECKING, Any, Literal, cast, override
 
 import torch
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy
-from transformers import GenerateOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from vla_project.models.backbones import LLMBackbone, VisionBackbone
@@ -14,6 +13,9 @@ from vla_project.overwatch import initialize_overwatch
 from vla_project.utils.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector
 
 from .vlm_base import VLM
+
+if TYPE_CHECKING:
+    from transformers import GenerateOutput
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
