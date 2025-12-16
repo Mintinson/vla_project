@@ -60,4 +60,10 @@ ignore = [
 
 [tool.uv.sources]
 dlimp = { path = "third_party/dlimp", editable = true }
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
 
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
